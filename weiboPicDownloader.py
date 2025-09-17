@@ -156,9 +156,12 @@ def progress(part, whole, percent = False):
 def request_fit(method, url, max_retry = 0, cookie = None, stream = False):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 9; Pixel 3 XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.80 Mobile Safari/537.36',
-        'Cookie': cookie,
-        'referer': 'https://m.weibo.cn/'
+        'referer': 'https://m.weibo.cn/',
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest'
     }
+    if cookie:
+        headers['Cookie'] = cookie
     try:
         return requests.request(method, url, headers = headers, timeout = 10, stream = stream, verify = False)
     except requests.exceptions.Timeout:
@@ -179,47 +182,78 @@ def nickname_to_uid(nickname):
     url = 'https://m.weibo.cn/n/{}'.format(nickname)
     try:
         response = request_fit('GET', url, cookie = token)
-        if response.status_code == 200:
-            # 兼容微博跳转变化：从重定向URL提取任意长度数字UID
-            m = re.search(r'/u/(\d+)$', response.url)
-            print(m)
-            print(response.url)
+        if 200 <= response.status_code < 400:
+            # 1) 直接从最终URL提取 /u/<uid>
+            m = re.search(r'/u/(\d+)(?:$|[/?#])', response.url)
             if m:
                 return m.group(1)
-            # 若无重定向到 /u/ 路径，则使用搜索API兜底
+
+            # 2) 若被带到 visitor 域，解析其 query 中的真实 m.weibo.cn 目标URL，再从中提取 UID
+            if 'visitor.passport.weibo.cn/visitor/visitor' in response.url:
+                try:
+                    from urllib.parse import urlparse, parse_qs, unquote
+                except Exception:
+                    from urlparse import urlparse, parse_qs
+                    from urllib import unquote
+                parsed = urlparse(response.url)
+                q = parse_qs(parsed.query)
+                target = q.get('url', [None])[0]
+                if target:
+                    target = unquote(target)
+                    m2 = re.search(r'/u/(\d+)(?:$|[/?#])', target)
+                    if m2:
+                        return m2.group(1)
+                    # 若目标仍是昵称页，尝试再请求一次目标URL
+                    try:
+                        t_resp = request_fit('GET', target, cookie = token)
+                        if 200 <= t_resp.status_code < 400:
+                            m3 = re.search(r'/u/(\d+)(?:$|[/?#])', t_resp.url)
+                            if m3:
+                                return m3.group(1)
+                    except Exception:
+                        pass
+
+            # 3) 使用 Web 接口：根据个性域名/昵称获取资料（更稳定）
+            try:
+                api_url = 'https://weibo.com/ajax/profile/info?custom={}'.format(quote(nickname))
+                api_resp = request_fit('GET', api_url, cookie = token)
+                if api_resp.status_code == 200:
+                    info = json.loads(api_resp.text)
+                    user_info = (info.get('data') or {}).get('user') or {}
+                    uid = user_info.get('id') or user_info.get('idstr')
+                    if uid:
+                        return str(uid)
+            except Exception:
+                pass
+
+            # 4) 若仍失败，使用 m 站搜索API兜底（可能误匹配）
             try:
                 search_url = 'https://m.weibo.cn/api/container/getIndex?containerid=100103type=3&q={}'.format(quote(nickname))
                 s_resp = request_fit('GET', search_url, cookie = token)
                 if s_resp.status_code == 200:
                     data = json.loads(s_resp.text)
-                    # 在返回中尽可能查找匹配的用户
                     candidates = []
                     for card in (data.get('data', {}).get('cards') or []):
-                        # 直接包含 user
                         user_obj = card.get('user')
                         if isinstance(user_obj, dict):
                             candidates.append(user_obj)
-                        # card_group 内的 user 列表
                         for sub in (card.get('card_group') or []):
                             if isinstance(sub, dict):
                                 if isinstance(sub.get('user'), dict):
                                     candidates.append(sub['user'])
                                 if isinstance(sub.get('users'), list):
                                     candidates.extend([u for u in sub['users'] if isinstance(u, dict)])
-                    # 优先精确匹配昵称
                     for u in candidates:
                         if u.get('screen_name') == nickname and (u.get('idstr') or u.get('id')):
                             return u.get('idstr') or str(u.get('id'))
-                    # 其次包含匹配
                     for u in candidates:
                         if nickname in (u.get('screen_name') or '') and (u.get('idstr') or u.get('id')):
                             return u.get('idstr') or str(u.get('id'))
-                    # 最后退回第一个候选
                     if candidates:
                         u0 = candidates[0]
                         if u0.get('idstr') or u0.get('id'):
                             return u0.get('idstr') or str(u0.get('id'))
-            except Exception as _:
+            except Exception:
                 pass
         elif response.status_code == 404:
             print_fit('警告: 用户昵称 "{}" 不存在'.format(nickname))
@@ -354,8 +388,16 @@ def get_resources(uid, video, interval, limit, start_page=1):
             json_data = json.loads(response.text)
             
             if json_data.get('ok') != 1:
-                error_msg = json_data.get('msg', '未知错误')
+                error_msg = json_data.get('msg') or json_data.get('message') or json_data.get('errmsg') or ''
+                if not error_msg:
+                    # 打印一小段响应体帮助定位
+                    snippet = response.text[:160].replace('\n', ' ')
+                    error_msg = '未知错误，响应片段: {}'.format(snippet)
                 print_fit('API返回错误: {}'.format(error_msg))
+                # 若触发极验验证，切换到桌面 Web 接口
+                if json_data.get('ok') == -100 and 'geetest' in response.text:
+                    print_fit('检测到极验验证，切换到桌面接口抓取...')
+                    return get_resources_web(uid, video, interval, limit, start_page=1)
                 # 如果是"这里还没有内容"，说明已经到达最后一页
                 if '还没有内容' in error_msg:
                     print_fit('已到达最后一页，停止扫描')
@@ -459,6 +501,115 @@ def get_resources(uid, video, interval, limit, start_page=1):
     print_fit('\npractically scan {} weibos, get {} {}'.format(amount, len(resources), 'resources' if video else 'pictures'))
     return resources
 
+def get_cookie_value(cookie_str, key):
+    try:
+        parts = [p.strip() for p in (cookie_str or '').split(';') if p.strip()]
+        for p in parts:
+            if p.startswith(key + '='):
+                return p[len(key) + 1:]
+    except Exception:
+        pass
+    return None
+
+def request_fit_web(method, url, cookie = None, stream = False):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://weibo.com/',
+        'Accept': 'application/json, text/plain, */*'
+    }
+    if cookie:
+        headers['Cookie'] = cookie
+        xsrf = get_cookie_value(cookie, 'XSRF-TOKEN')
+        if xsrf:
+            headers['X-XSRF-TOKEN'] = xsrf
+    return requests.request(method, url, headers = headers, timeout = 10, stream = stream, verify = False)
+
+def get_resources_web(uid, video, interval, limit, start_page = 1):
+    page = start_page
+    amount = 0
+    total = 0
+    resources = []
+    empty_pages = 0
+    aware = 3
+
+    while empty_pages < aware:
+        try:
+            url = 'https://weibo.com/ajax/statuses/mymblog?uid={}&page={}&feature=0'.format(uid, page)
+            print_fit('正在请求(桌面)第{}页...'.format(page))
+            response = request_fit_web('GET', url, cookie = token)
+            if response.status_code != 200:
+                print_fit('桌面接口失败，状态码: {}'.format(response.status_code))
+                empty_pages += 1
+                time.sleep(interval)
+                continue
+
+            data = json.loads(response.text)
+            if not isinstance(data, dict) or not data.get('data') or not data['data'].get('list'):
+                empty_pages += 1
+                time.sleep(interval)
+                continue
+
+            lst = data['data']['list']
+            total = max(total, data['data'].get('count', 0))
+
+            for mblog in lst:
+                try:
+                    if mblog.get('isTop'): 
+                        continue
+                    mid = int(mblog.get('mid') or mblog.get('id') or 0)
+                    date = parse_date(mblog.get('created_at') or '')
+                    mark = {'mid': mid, 'bid': mblog.get('bid'), 'date': date, 'text': mblog.get('text', '')}
+                    amount += 1
+
+                    if compare(limit[0], '>', [mid, date]):
+                        return resources
+                    if compare(limit[0], '>', [mid, date]) or compare(limit[1], '<', [mid, date]):
+                        continue
+
+                    # 图片
+                    pic_ids = mblog.get('pic_ids') or []
+                    pic_infos = mblog.get('pic_infos') or {}
+                    index = 0
+                    for pid in pic_ids:
+                        index += 1
+                        info = pic_infos.get(pid) or {}
+                        large = (info.get('largest') or info.get('original') or info.get('large') or {}).get('url')
+                        if not large:
+                            # 兜底从多分辨率字段取
+                            for key in ['mw2000','mw690','bmiddle','thumbnail']:
+                                u = (info.get(key) or {}).get('url')
+                                if u:
+                                    large = u
+                                    break
+                        if large:
+                            resources.append(merge({'url': large, 'index': index, 'type': 'photo'}, mark))
+
+                    # 视频
+                    if video:
+                        page_info = mblog.get('page_info') or {}
+                        media_info = page_info.get('media_info') or {}
+                        best = None
+                        for key in ['mp4_4k_mp4','mp4_2k_mp4','mp4_1080p_mp4','mp4_720p_mp4','mp4_hd_url','stream_url_hd','stream_url','mp4_sd_url']:
+                            if media_info.get(key):
+                                best = media_info.get(key)
+                                break
+                        if best:
+                            resources.append(merge({'url': best, 'type': 'video', 'quality': 'web'}, mark))
+                except Exception:
+                    pass
+
+            print_fit('{} {}(#{}) - 图片:{} 视频:{}'.format('analysing weibos...', progress(amount, total), page, len([r for r in resources if r.get('type') == 'photo']), len([r for r in resources if r.get('type') == 'video'])), pin = True)
+            page += 1
+            empty_pages = 0 if lst else empty_pages + 1
+        except Exception as e:
+            print_fit('桌面接口异常: {}'.format(str(e)))
+            empty_pages += 1
+        finally:
+            time.sleep(interval)
+
+    print_fit('\npractically scan {} weibos, get {} {}'.format(amount, len(resources), 'resources' if video else 'pictures'))
+    return resources
+
 def format_name(item):
     # 从URL中提取文件扩展名
     url = item['url']
@@ -514,7 +665,7 @@ def download(url, path, overwrite):
         print_fit('文件已存在，跳过: {}'.format(os.path.basename(path)))
         return True
     try:
-        response = request_fit('GET', url, stream = True)
+        response = request_fit('GET', url, stream = True, cookie = token)
         if response.status_code != 200:
             print_fit('下载失败，状态码: {} - {}'.format(response.status_code, os.path.basename(path)))
             return False
@@ -536,7 +687,6 @@ def download(url, path, overwrite):
         print_fit('下载异常: {} - {}'.format(str(e), os.path.basename(path)))
         if os.path.exists(path): os.remove(path)
         return False
-
 
 args = parser.parse_args(nargs_fit(parser, sys.argv[1:]))
 
@@ -607,8 +757,12 @@ if args.cookie:
     else:
         token = 'SUB={}'.format(args.cookie)
 else:
-    # 使用默认Cookie（您提供的Cookie）
-    token = '_2A25FzJJjDeRhGeVH41YT9yfLyzuIHXVmo6urrDV6PUJbktANLWenkW1NTrjFDl5_G0EMYvJeDYXkhJXPVKkymWGS'
+    # 尝试从环境变量读取，避免将敏感 SUB 写入代码
+    env_cookie = os.environ.get('WEIBO_SUB') or os.environ.get('WEIBO_COOKIE')
+    if env_cookie:
+        token = env_cookie if env_cookie.startswith('SUB=') else 'SUB={}'.format(env_cookie)
+    else:
+        quit('missing cookie: 请通过 -c 传入 SUB，或设置环境变量 WEIBO_SUB')
 pool = concurrent.futures.ThreadPoolExecutor(max_workers = args.size)
 # print(users)
 for number, user in enumerate(users, 1):
