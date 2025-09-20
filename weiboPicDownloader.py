@@ -526,6 +526,7 @@ def request_fit_web(method, url, cookie = None, stream = False):
 
 def get_resources_web(uid, video, interval, limit, start_page = 1):
     page = start_page
+    size = 50  # 增加每页数量，提高下载效率
     amount = 0
     total = 0
     resources = []
@@ -534,7 +535,7 @@ def get_resources_web(uid, video, interval, limit, start_page = 1):
 
     while empty_pages < aware:
         try:
-            url = 'https://weibo.com/ajax/statuses/mymblog?uid={}&page={}&feature=0'.format(uid, page)
+            url = 'https://weibo.com/ajax/statuses/mymblog?uid={}&page={}&count={}&feature=0'.format(uid, page, size)
             print_fit('正在请求(桌面)第{}页...'.format(page))
             response = request_fit_web('GET', url, cookie = token)
             if response.status_code != 200:
@@ -605,7 +606,7 @@ def get_resources_web(uid, video, interval, limit, start_page = 1):
             print_fit('桌面接口异常: {}'.format(str(e)))
             empty_pages += 1
         finally:
-            time.sleep(interval)
+            time.sleep(interval * 0.5)  # 减少桌面版API的请求间隔，提高速度
 
     print_fit('\npractically scan {} weibos, get {} {}'.format(amount, len(resources), 'resources' if video else 'pictures'))
     return resources
@@ -623,7 +624,7 @@ def format_name(item):
         if ext not in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'mp4', 'mov', 'avi']:
             ext = 'png'  # 默认扩展名
     else:
-        ext = 'png'  # 默认扩展名
+        ext = 'mp4'  # 默认扩展名
     
     # 格式化日期为 YYYY-MM-DD 格式，处理日期为None的情况
     if item['date'] is not None:
